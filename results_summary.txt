@@ -1,0 +1,16 @@
+=== Results ===
+Model: resnet50  input: 224px
+Queries with positives (<= 10.0 m): 5092/5092
+Recall@1:  0.159
+Recall@5:  0.383
+Recall@10: 0.506
+Embed speed: train 0.0263s/img, test 0.0256s/img
+
+=== Results ===
+Model: convnext_b  input: 224px
+Queries with positives (<= 10.0 m): 5092/5092
+Recall@1:  0.197
+Recall@5:  0.437
+Recall@10: 0.548
+Embed speed: train 0.0275s/img, test 0.0277s/img
+Saved embeddings and search results to runs_convnext_b_224.npz
