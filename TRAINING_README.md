@@ -2,24 +2,97 @@
 
 This directory contains training scripts for Visual Place Recognition (VPR) models using hybrid triplet loss and contrastive learning approaches.
 
-## Overview 
+## Overview
 
 The training approach implements:
 
 1. **Frozen Backbone Training**: Only train a projection head while keeping pretrained features frozen
-2. **Hybrid Loss**: Combines triplet loss and contrastive learning
+2. **Hybrid Loss**: Combines triplet loss and contrastive learning  
 3. **Hard Negative Mining**: Smart sampling of difficult negative examples
 4. **GPS-based Supervision**: Uses GPS coordinates to define positive/negative relationships
 5. **Reproducibility**: Fixed seeds and standardized hyperparameters across models
+6. **Comprehensive Logging**: Automatic metric logging to CSV files for analysis
 
 ## Files
 
 - `train_vpr.py` - Main training script with all loss functions and data mining
 - `eval_trained.py` - Evaluation script for trained models  
 - `run_experiment.py` - Complete pipeline script (baseline → training → evaluation)
+- `analyze_metrics.py` - Script to analyze and plot training metrics
 - `trainable_vpr.py` - Extended encoder classes with projection heads
 
-## Key Features
+## Directory Structure
+
+After training, the following directories will be created:
+
+```
+vpr-baseline/
+├── logs/                          # Training metrics (CSV files)
+│   ├── dinov2_b_seed42_20240911_143022.csv
+│   ├── convnext_b_seed42_20240911_145033.csv
+│   └── training_summary.csv       # Automatic summary of all runs
+├── trained_models/                # Saved model weights
+│   ├── trained_dinov2_b_seed42.pth
+│   ├── trained_convnext_b_seed42.pth
+│   └── ...
+└── plots/                         # Generated analysis plots
+    ├── dinov2_b_seed42_20240911_143022_plots.png
+    └── ...
+```
+
+## Usage
+
+### Basic Training
+
+```bash
+# Train a single model
+python train_vpr.py --train_csv train_data.csv --val_csv val_data.csv --model dinov2_b --epochs 10
+
+# Train with custom hyperparameters
+python train_vpr.py --train_csv train_data.csv --val_csv val_data.csv \
+    --model convnext_b --epochs 15 --lr 0.0005 --batch_size 64 \
+    --triplet_margin 0.2 --weight_decay 0.001
+```
+
+### Complete Experiment Pipeline
+
+```bash
+# Run full baseline → training → evaluation
+python run_experiment.py --train_csv train.csv --val_csv val.csv --test_csv test.csv --model dinov2_b
+```
+
+### Analyze Training Results
+
+```bash
+# Analyze metrics from a specific training run
+python analyze_metrics.py logs/dinov2_b_seed42_20240911_143022.csv
+
+# Analyze all training runs in logs/ directory
+python analyze_metrics.py logs/
+```
+
+## Logged Metrics
+
+The training script automatically logs detailed metrics to CSV files:
+
+### Batch-level Metrics
+- `batch`: Batch number
+- `epoch`: Current epoch
+- `train_loss`, `triplet_loss`, `contrastive_loss`: Loss components
+- `batch_time`: Time to process the batch
+
+### Epoch Summary Metrics  
+- `epoch`: Epoch number
+- `avg_train_loss`, `avg_triplet_loss`, `avg_contrastive_loss`: Average losses
+- `epoch_time`: Total epoch time
+
+### Validation Metrics
+- `val_loss`: Validation loss
+- `val_r1`, `val_r5`, `val_r10`: Recall @ 1, 5, 10
+- `val_time`: Validation time
+
+All metrics include timestamps and event types for easy analysis and plotting.
+```## Key Features
 
 ### Reproducibility Strategy
 - Fixed random seeds (default: 42)

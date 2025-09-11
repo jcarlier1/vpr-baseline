@@ -7,9 +7,76 @@ import torch, faiss, timm
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+import csv
+import os
+from datetime import datetime
 
 from transformers import AutoProcessor, AutoImageProcessor, AutoModel
 from vpr_baseline import Encoder, haversine_np, load_csv, evaluate
+
+# ========== METRIC LOGGING ==========
+class MetricLogger:
+    """Logs training metrics to CSV file for later plotting"""
+    def __init__(self, log_dir="logs", model_name="vpr_model", seed=42):
+        self.log_dir = log_dir
+        self.model_name = model_name
+        self.seed = seed
+        os.makedirs(log_dir, exist_ok=True)
+        
+        # Create unique log file
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.log_file = os.path.join(log_dir, f"{model_name}_seed{seed}_{timestamp}.csv")
+        
+        # Initialize CSV file with headers
+        with open(self.log_file, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                'timestamp', 'epoch', 'batch', 'total_loss', 'contrastive_loss', 
+                'triplet_loss', 'learning_rate', 'validation_recall', 'event_type'
+            ])
+        
+        print(f"Logging metrics to: {self.log_file}")
+    
+    def log_batch(self, epoch, batch_idx, total_loss, cont_loss, trip_loss, lr):
+        """Log per-batch metrics"""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(self.log_file, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                timestamp, epoch, batch_idx, 
+                f"{total_loss:.6f}", f"{cont_loss:.6f}", f"{trip_loss:.6f}",
+                f"{lr:.6f}", "", "batch"
+            ])
+    
+    def log_epoch(self, epoch, total_loss, cont_loss, trip_loss, lr):
+        """Log epoch summary metrics"""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(self.log_file, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                timestamp, epoch, "summary", 
+                f"{total_loss:.6f}", f"{cont_loss:.6f}", f"{trip_loss:.6f}",
+                f"{lr:.6f}", "", "epoch_summary"
+            ])
+    
+    def log_validation(self, epoch, recall):
+        """Log validation metrics"""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(self.log_file, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                timestamp, epoch, "validation", "", "", "", "", f"{recall:.6f}", "validation"
+            ])
+    
+    def log_final_summary(self, best_recall, total_epochs, training_time):
+        """Log final training summary"""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(self.log_file, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                timestamp, total_epochs-1, "final", "", "", "", "", 
+                f"{best_recall:.6f}", f"training_complete_time_{training_time:.1f}s"
+            ])
 
 # ========== REPRODUCIBILITY ==========
 def set_reproducible_training(seed=42):
@@ -179,7 +246,8 @@ class MultiPositiveContrastiveLoss(nn.Module):
         if valid_mask.sum() > 0:
             return loss[valid_mask].mean()
         else:
-            return torch.tensor(0.0, device=embeddings.device)
+            # Return zero tensor that requires gradients and is connected to computation graph
+            return torch.zeros(1, device=embeddings.device, requires_grad=True).squeeze()
 
 class HybridVPRLoss(nn.Module):
     """Combined triplet and contrastive loss"""
@@ -195,7 +263,8 @@ class HybridVPRLoss(nn.Module):
         cont_loss = self.contrastive(embeddings, labels)
         total_loss = self.cont_weight * cont_loss
         
-        trip_loss = torch.tensor(0.0, device=embeddings.device)
+        # Initialize trip_loss with gradients enabled
+        trip_loss = torch.zeros(1, device=embeddings.device, requires_grad=True).squeeze()
         
         # Add triplet loss if triplets provided
         if triplets is not None and len(triplets) > 0:
@@ -316,15 +385,18 @@ def mine_triplets_online(embeddings, coordinates, labels, num_triplets=8, hard_n
 # ========== DATASET ==========
 class VPRDataset(Dataset):
     """Dataset for VPR training with GPS coordinates"""
-    def __init__(self, df, pos_threshold_m=25):
+    def __init__(self, df, pos_threshold_m=25, precomputed_labels=None):
         self.df = df
         self.pos_threshold_m = pos_threshold_m
         
-        # Create GPS-based labels
-        coordinates = df[['lat', 'lon']].values
-        self.labels = create_gps_labels(coordinates, pos_threshold_m)
-        
-        print(f"Created {len(np.unique(self.labels))} GPS clusters from {len(df)} images")
+        # Use precomputed labels if provided, otherwise create new ones
+        if precomputed_labels is not None:
+            self.labels = precomputed_labels
+            print(f"Using precomputed GPS labels with {len(np.unique(self.labels))} clusters")
+        else:
+            coordinates = df[['lat', 'lon']].values
+            self.labels = create_gps_labels(coordinates, pos_threshold_m)
+            print(f"Created {len(np.unique(self.labels))} GPS clusters from {len(df)} images")
         
     def __len__(self):
         return len(self.df)
@@ -356,7 +428,7 @@ def collate_fn(batch):
     }
 
 # ========== TRAINING LOOP ==========
-def train_vpr_model(model, train_loader, val_df, config, save_path):
+def train_vpr_model(model, train_loader, val_df, config, save_path, model_name="vpr_model", seed=42):
     """Main training loop with hybrid loss and hard negative mining"""
     
     # Setup loss and optimizer
@@ -375,12 +447,21 @@ def train_vpr_model(model, train_loader, val_df, config, save_path):
     
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, config['epochs'])
     
+    # Initialize metric logger
+    logger = MetricLogger(model_name=model_name, seed=seed)
+    
     best_recall = 0.0
     model.train()
+    training_start_time = time.time()
+    
+    # Extract train_df and labels for validation (avoid recreating labels)
+    train_df = train_loader.dataset.df
+    train_labels = train_loader.dataset.labels
     
     print("Starting training...")
     
     for epoch in range(config['epochs']):
+        epoch_start_time = time.time()
         epoch_losses = {'total': 0, 'contrastive': 0, 'triplet': 0}
         num_batches = 0
         
@@ -416,8 +497,17 @@ def train_vpr_model(model, train_loader, val_df, config, save_path):
                 epoch_losses[key] += loss_dict[key].item()
             num_batches += 1
             
-            # Print progress
+            # Log and print progress
+            current_lr = optimizer.param_groups[0]['lr']
             if batch_idx % 20 == 0:
+                logger.log_batch(
+                    epoch, batch_idx, 
+                    loss_dict['total'].item(), 
+                    loss_dict['contrastive'].item(),
+                    loss_dict['triplet'].item(),
+                    current_lr
+                )
+                
                 print(f"Epoch {epoch:2d}, Batch {batch_idx:3d}: "
                       f"Total={loss_dict['total'].item():.4f}, "
                       f"Cont={loss_dict['contrastive'].item():.4f}, "
@@ -428,15 +518,21 @@ def train_vpr_model(model, train_loader, val_df, config, save_path):
         # Epoch summary
         for key in epoch_losses:
             epoch_losses[key] /= num_batches
-            
+        
+        current_lr = optimizer.param_groups[0]['lr']
+        logger.log_epoch(epoch, epoch_losses['total'], epoch_losses['contrastive'], epoch_losses['triplet'], current_lr)
+        
+        epoch_time = time.time() - epoch_start_time
         print(f"Epoch {epoch:2d} Summary: "
               f"Total={epoch_losses['total']:.4f}, "
               f"Cont={epoch_losses['contrastive']:.4f}, "
-              f"Trip={epoch_losses['triplet']:.4f}")
+              f"Trip={epoch_losses['triplet']:.4f}, "
+              f"Time={epoch_time:.1f}s")
         
-        # Validation every few epochs
+        # Proper validation every few epochs
         if epoch % 3 == 0 or epoch == config['epochs'] - 1:
-            val_recall = validate_model(model, val_df, config)
+            val_recall, train_labels = validate_model(model, train_df, val_df, config, train_labels)
+            logger.log_validation(epoch, val_recall)
             print(f"Validation R@1: {val_recall:.4f}")
             
             # Save best model
@@ -446,48 +542,81 @@ def train_vpr_model(model, train_loader, val_df, config, save_path):
                     'model_state_dict': model.state_dict(),
                     'config': config,
                     'epoch': epoch,
-                    'recall': val_recall
+                    'recall': val_recall,
+                    'model_name': model_name,
+                    'seed': seed,
+                    'training_time': time.time() - training_start_time
                 }, save_path)
-                print(f"Saved best model with R@1: {val_recall:.4f}")
+                print(f"Saved best model with R@1: {val_recall:.4f} to {save_path}")
     
-    print(f"Training completed. Best validation R@1: {best_recall:.4f}")
+    total_training_time = time.time() - training_start_time
+    logger.log_final_summary(best_recall, config['epochs'], total_training_time)
+    
+    print(f"Training completed in {total_training_time:.1f}s. Best validation R@1: {best_recall:.4f}")
+    print(f"Metrics logged to: {logger.log_file}")
     return best_recall
 
-def validate_model(model, val_df, config):
-    """Validate model on validation set"""
+def validate_model(model, train_df, val_df, config, train_labels=None):
+    """Proper validation: train embeddings vs val embeddings"""
     model.eval()
     
-    # Create validation dataset and loader  
+    # Create train dataset (use precomputed labels to avoid recreation)
+    if train_labels is None:
+        train_dataset = VPRDataset(train_df, config['pos_threshold_m'])
+        train_labels = train_dataset.labels
+    else:
+        train_dataset = VPRDataset(train_df, config['pos_threshold_m'], train_labels)
+    
+    # Create val dataset (separate clustering)
     val_dataset = VPRDataset(val_df, config['pos_threshold_m'])
+    
+    # Create loaders
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=False, collate_fn=collate_fn)
     val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, collate_fn=collate_fn)
     
-    embeddings = []
-    coordinates = []
+    # Extract train embeddings (gallery)
+    train_embeddings = []
+    train_coordinates = []
+    
+    with torch.no_grad():
+        for batch in train_loader:
+            emb = model.forward(batch['images'])
+            train_embeddings.append(emb.cpu().numpy())
+            train_coordinates.append(batch['coordinates'].cpu().numpy())
+    
+    train_embeddings = np.concatenate(train_embeddings, axis=0)
+    train_coordinates = np.concatenate(train_coordinates, axis=0)
+    
+    # Extract val embeddings (queries)
+    val_embeddings = []
+    val_coordinates = []
     
     with torch.no_grad():
         for batch in val_loader:
             emb = model.forward(batch['images'])
-            embeddings.append(emb.cpu().numpy())
-            coordinates.append(batch['coordinates'].cpu().numpy())
+            val_embeddings.append(emb.cpu().numpy())
+            val_coordinates.append(batch['coordinates'].cpu().numpy())
     
-    embeddings = np.concatenate(embeddings, axis=0)
-    coordinates = np.concatenate(coordinates, axis=0)
+    val_embeddings = np.concatenate(val_embeddings, axis=0)
+    val_coordinates = np.concatenate(val_coordinates, axis=0)
     
-    # Simple self-retrieval evaluation (train==test for validation)
-    dim = embeddings.shape[1]
+    # Build FAISS index with TRAIN embeddings
+    dim = train_embeddings.shape[1]
     index = faiss.IndexFlatIP(dim)
-    index.add(embeddings.astype('float32'))
-    D, I = index.search(embeddings.astype('float32'), 10)
+    index.add(train_embeddings.astype('float32'))
     
-    # Evaluate
+    # Search VAL embeddings against TRAIN index
+    D, I = index.search(val_embeddings.astype('float32'), 10)
+    
+    # Evaluate: val queries vs train gallery
     metrics = evaluate(
-        coordinates[:, 0], coordinates[:, 1],  # train
-        coordinates[:, 0], coordinates[:, 1],  # test (same for validation)
+        train_coordinates[:, 0], train_coordinates[:, 1],  # gallery (train)
+        val_coordinates[:, 0], val_coordinates[:, 1],     # queries (val)
         I, config['pos_threshold_m']
     )
     
     model.train()
-    return metrics['R@1']
+    return metrics['R@1'], train_labels  # Return labels for reuse
 
 # ========== MAIN ==========
 def main():
@@ -547,11 +676,15 @@ def main():
         num_workers=4
     )
     
-    # Set save path
-    save_path = args.save_path if args.save_path else f"trained_{args.model}_seed{args.seed}.pth"
+    # Create directories for organized saving
+    os.makedirs("logs", exist_ok=True)
+    os.makedirs("trained_models", exist_ok=True)
+    
+    # Set save path in trained_models directory
+    save_path = args.save_path if args.save_path else f"trained_models/trained_{args.model}_seed{args.seed}.pth"
     
     # Train model
-    best_recall = train_vpr_model(model, train_loader, df_val, config, save_path)
+    best_recall = train_vpr_model(model, train_loader, df_val, config, save_path, args.model, args.seed)
     
     print(f"\nTraining completed!")
     print(f"Model: {args.model}")
