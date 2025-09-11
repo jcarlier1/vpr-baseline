@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 from PIL import Image
 import torch, faiss, timm
+import torch.nn as nn
 import torch.nn.functional as F
 
 from transformers import AutoProcessor, AutoImageProcessor, AutoModel
@@ -21,8 +22,9 @@ def haversine_np(lat1, lon1, lat2, lon2):
     return R * c  # meters
 
 # ---------- encoders ----------
-class Encoder:
+class Encoder(nn.Module):
     def __init__(self, name, input_size=224, device="cuda"):
+        super().__init__()
         self.name = name
         self.device = device
         self.input_size = input_size

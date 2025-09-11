@@ -150,6 +150,9 @@ class MultiPositiveContrastiveLoss(nn.Module):
     def forward(self, embeddings, labels):
         batch_size = embeddings.size(0)
         
+        # Ensure labels are on the same device as embeddings
+        labels = labels.to(embeddings.device)
+        
         # Cosine similarity matrix
         sim_matrix = F.cosine_similarity(
             embeddings.unsqueeze(1), 
@@ -265,8 +268,9 @@ def mine_hard_negatives_online(embeddings, coordinates, labels, hard_neg_ratio=0
 
 def mine_triplets_online(embeddings, coordinates, labels, num_triplets=8, hard_neg_ratio=0.5, neg_threshold_m=100.0):
     """Mine triplets with hard negative sampling"""
-    labels_np = labels.cpu().numpy() if isinstance(labels, torch.Tensor) else labels
-    coords_np = np.array(coordinates)
+    # Ensure tensors are on CPU for numpy operations
+    labels_np = labels.detach().cpu().numpy() if isinstance(labels, torch.Tensor) else labels
+    coords_np = coordinates.detach().cpu().numpy() if isinstance(coordinates, torch.Tensor) else coordinates
     
     triplets = []
     max_attempts = num_triplets * 3  # Prevent infinite loops
@@ -381,6 +385,11 @@ def train_vpr_model(model, train_loader, val_df, config, save_path):
         num_batches = 0
         
         for batch_idx, batch in enumerate(train_loader):
+            # Move batch data to device (get device from model)
+            device = next(model.parameters()).device
+            batch_labels = batch['labels'].to(device)
+            batch_coordinates = batch['coordinates'].to(device)
+            
             # Forward pass
             embeddings = model.forward(batch['images'])
             
@@ -388,14 +397,14 @@ def train_vpr_model(model, train_loader, val_df, config, save_path):
             triplets = None
             if batch_idx % 3 == 0:  # Mine every 3rd batch
                 triplets = mine_triplets_online(
-                    embeddings, batch['coordinates'], batch['labels'],
+                    embeddings, batch_coordinates, batch_labels,
                     num_triplets=min(8, len(embeddings)//2),
                     hard_neg_ratio=config['hard_neg_ratio'],
                     neg_threshold_m=config['neg_threshold_m']
                 )
             
             # Compute loss
-            loss_dict = hybrid_loss(embeddings, batch['labels'], triplets)
+            loss_dict = hybrid_loss(embeddings, batch_labels, triplets)
             
             # Backward pass
             optimizer.zero_grad()
