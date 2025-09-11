@@ -13,4 +13,35 @@ Recall@1:  0.197
 Recall@5:  0.437
 Recall@10: 0.548
 Embed speed: train 0.0275s/img, test 0.0277s/img
-Saved embeddings and search results to runs_convnext_b_224.npz
+
+=== Results ===
+Model: dinov2_b  input: 224px
+Queries with positives (<= 10.0 m): 5092/5092
+Recall@1:  0.207
+Recall@5:  0.496
+Recall@10: 0.646
+Embed speed: train 0.0323s/img, test 0.0342s/img
+
+=== Results ===
+Model: siglip_b16  input: 224px
+Queries with positives (<= 10.0 m): 5092/5092
+Recall@1:  0.165
+Recall@5:  0.409
+Recall@10: 0.547
+Embed speed: train 0.0301s/img, test 0.0312s/img
+
+=== Results ===
+Model: clip_l14  input: 224px
+Queries with positives (<= 10.0 m): 5092/5092
+Recall@1:  0.126
+Recall@5:  0.338
+Recall@10: 0.463
+Embed speed: train 0.0331s/img, test 0.0333s/img
+
+=== Results ===
+Model: clip_b32  input: 224px
+Queries with positives (<= 10.0 m): 5092/5092
+Recall@1:  0.147
+Recall@5:  0.352
+Recall@10: 0.458
+Embed speed: train 0.0308s/img, test 0.0325s/img
