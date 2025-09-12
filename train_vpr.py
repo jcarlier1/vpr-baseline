@@ -656,7 +656,9 @@ def main():
     print(f"Train: {len(df_train)} images, Val: {len(df_val)} images")
     
     # Create model
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for training but was not found.")
+    device = "cuda"
     model = TrainableVPREncoder(
         args.model, 
         input_size=args.input_size, 
