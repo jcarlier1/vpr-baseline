@@ -86,16 +86,47 @@ def load_csv(csv_path, camera_id=None):
     return df.reset_index(drop=True)
 
 def batched_paths_to_embeddings(paths, enc: Encoder, batch_size):
+    from torch.utils.data import DataLoader, Dataset
+    import torchvision.transforms as T
+    
+    class ImageDataset(Dataset):
+        def __init__(self, paths, transform=None):
+            self.paths = paths
+            self.transform = transform
+        
+        def __len__(self):
+            return len(self.paths)
+        
+        def __getitem__(self, idx):
+            img = Image.open(self.paths[idx]).convert("RGB")
+            if self.transform:
+                img = self.transform(img)
+            return img
+    
+    # Use faster transforms if available
+    if hasattr(enc, 'timm_tf'):
+        transform = enc.timm_tf
+    else:
+        transform = None  # CLIP/DINO handle their own preprocessing
+    
+    dataset = ImageDataset(paths, transform)
+    dataloader = DataLoader(dataset, batch_size=batch_size, num_workers=4, pin_memory=True)
+    
     embs = []
-    n = len(paths)
     t0 = time.time()
-    for i in range(0, n, batch_size):
-        batch_paths = paths[i:i+batch_size]
-        pil_batch = [Image.open(p).convert("RGB") for p in batch_paths]
-        embs.append(enc.encode_batch(pil_batch))
-    embs = torch.cat(embs, dim=0)  # Keep on GPU as tensor
+    for batch in dataloader:
+        if enc.kind == "transformers_clip":
+            pil_batch = [T.ToPILImage()(img) for img in batch]  # Convert back to PIL for CLIP
+            embs.append(enc.encode_batch(pil_batch))
+        elif enc.kind == "transformers_dino":
+            pil_batch = [T.ToPILImage()(img) for img in batch]
+            embs.append(enc.encode_batch(pil_batch))
+        else:  # timm - already transformed
+            embs.append(enc.encode_batch(batch))
+    
+    embs = torch.cat(embs, dim=0)
     dt = time.time() - t0
-    return embs, dt / n  # seconds per image
+    return embs, dt / len(paths)
 
 # ---------- eval ----------
 def evaluate(train_lat, train_lon, test_lat, test_lon, topk_idx, pos_thresh_m):
@@ -134,7 +165,7 @@ def main():
     ap.add_argument("--model", required=True,
                     choices=["clip_b32", "clip_l14", "siglip_b16", "dinov2_b", "convnext_b", "resnet50"])
     ap.add_argument("--input", type=int, default=224)
-    ap.add_argument("--batch", type=int, default=128)
+    ap.add_argument("--batch", type=int, default=512)
     ap.add_argument("--pos_m", type=float, default=10.0)
     ap.add_argument("--k", type=int, default=10)
     ap.add_argument("--save_npz", type=str, default="")
