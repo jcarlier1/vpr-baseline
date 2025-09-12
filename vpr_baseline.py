@@ -64,17 +64,17 @@ class Encoder(nn.Module):
             inputs = self.processor(images=pil_batch, return_tensors="pt").to(self.device)
             with torch.autocast(device_type="cuda", dtype=torch.float16):
                 feats = self.model.get_image_features(**inputs)
-            return F.normalize(feats.float(), dim=-1).cpu().numpy()
+            return F.normalize(feats.float(), dim=-1)
         elif self.kind == "transformers_dino":
             inputs = self.processor(images=pil_batch, return_tensors="pt")["pixel_values"].to(self.device)
             with torch.autocast(device_type="cuda", dtype=torch.float16):
                 out = self.model(inputs).last_hidden_state[:, 0]  # CLS token
-            return F.normalize(out.float(), dim=-1).cpu().numpy()
+            return F.normalize(out.float(), dim=-1)
         else:  # timm
             x = torch.stack([self.timm_tf(img) for img in pil_batch]).to(self.device)
             with torch.autocast(device_type="cuda", dtype=torch.float16):
                 out = self.model(x)
-            return F.normalize(out.float(), dim=-1).cpu().numpy()
+            return F.normalize(out.float(), dim=-1)
 
 # ---------- io ----------
 def load_csv(csv_path, camera_id=None):
@@ -93,7 +93,7 @@ def batched_paths_to_embeddings(paths, enc: Encoder, batch_size):
         batch_paths = paths[i:i+batch_size]
         pil_batch = [Image.open(p).convert("RGB") for p in batch_paths]
         embs.append(enc.encode_batch(pil_batch))
-    embs = np.concatenate(embs, axis=0)
+    embs = torch.cat(embs, dim=0)  # Keep on GPU as tensor
     dt = time.time() - t0
     return embs, dt / n  # seconds per image
 
@@ -155,9 +155,15 @@ def main():
 
     # FAISS index (cosine via inner product on L2-normalized vectors)
     dim = xb.shape[1]
+    res = faiss.StandardGpuResources()  # Add GPU resources
     index = faiss.IndexFlatIP(dim)
-    index.add(xb.astype("float32"))
-    D, I = index.search(xq.astype("float32"), args.k)
+    index = faiss.index_cpu_to_gpu(res, 0, index)  # Move to GPU
+    # Convert GPU tensors to numpy float32 for FAISS (only conversion needed)
+    xb_numpy = xb.cpu().numpy().astype("float32")
+    xq_numpy = xq.cpu().numpy().astype("float32")
+    index.add(xb_numpy)
+    D, I = index.search(xq_numpy, args.k)
+
 
     # Evaluation by GPS distance threshold
     metrics = evaluate(
@@ -176,8 +182,8 @@ def main():
     if args.save_npz:
         np.savez_compressed(
             args.save_npz,
-            xb=xb.astype("float16"),
-            xq=xq.astype("float16"),
+            xb=xb.cpu().numpy().astype("float16"),
+            xq=xq.cpu().numpy().astype("float16"),
             train_lat=df_tr["lat"].to_numpy().astype("float32"),
             train_lon=df_tr["lon"].to_numpy().astype("float32"),
             test_lat=df_te["lat"].to_numpy().astype("float32"),

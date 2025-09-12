@@ -23,7 +23,7 @@ conda install -c pytorch -c nvidia pytorch torchvision pytorch-cuda=12.1 -y
 
 # POC dependencies
 pip install transformers==4.42.4 timm==1.0.7 faiss-cpu==1.7.4 \
-            pandas==2.2.2 numpy==1.26.4 pillow==10.3.0 accelerate==0.33.0
+            faiss-gpu==1.7.2 pandas==2.2.2 numpy==1.26.4 pillow==10.3.0 \ accelerate==0.33.0
 ```
 
 **Note:** If you want to use the SigLIP model (`--model siglip_b16`), you must also install the `sentencepiece` library:
