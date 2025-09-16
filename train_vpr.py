@@ -683,7 +683,7 @@ def main():
     os.makedirs("trained_models", exist_ok=True)
     
     # Set save path in trained_models directory
-    save_path = args.save_path if args.save_path else f"trained_models/trained_{args.model}_seed{args.seed}.pth"
+    save_path = args.save_path if args.save_path else f"trained_models/trained_{args.model}.pth"
     
     # Train model
     best_recall = train_vpr_model(model, train_loader, df_val, config, save_path, args.model, args.seed)
