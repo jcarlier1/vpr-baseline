@@ -385,18 +385,20 @@ def mine_triplets_online(embeddings, coordinates, labels, num_triplets=8, hard_n
 # ========== DATASET ==========
 class VPRDataset(Dataset):
     """Dataset for VPR training with GPS coordinates"""
-    def __init__(self, df, pos_threshold_m=25, precomputed_labels=None):
+    def __init__(self, df, pos_threshold_m=25, precomputed_labels=None, create_labels=True):
         self.df = df
         self.pos_threshold_m = pos_threshold_m
-        
-        # Use precomputed labels if provided, otherwise create new ones
+        # Use precomputed labels if provided, otherwise create new ones or skip
         if precomputed_labels is not None:
             self.labels = precomputed_labels
             print(f"Using precomputed GPS labels with {len(np.unique(self.labels))} clusters")
-        else:
+        elif create_labels:
             coordinates = df[['lat', 'lon']].values
             self.labels = create_gps_labels(coordinates, pos_threshold_m)
             print(f"Created {len(np.unique(self.labels))} GPS clusters from {len(df)} images")
+        else:
+            # Assign dummy labels (not used)
+            self.labels = np.zeros(len(df), dtype=int)
         
     def __len__(self):
         return len(self.df)
@@ -567,8 +569,8 @@ def validate_model(model, train_df, val_df, config, train_labels=None):
     else:
         train_dataset = VPRDataset(train_df, config['pos_threshold_m'], train_labels)
     
-    # Create val dataset (separate clustering)
-    val_dataset = VPRDataset(val_df, config['pos_threshold_m'])
+    # Create val dataset (skip clustering, labels not used)
+    val_dataset = VPRDataset(val_df, config['pos_threshold_m'], create_labels=False)
     
     # Create loaders
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=False, collate_fn=collate_fn)
@@ -581,7 +583,7 @@ def validate_model(model, train_df, val_df, config, train_labels=None):
     with torch.no_grad():
         for batch in train_loader:
             emb = model.forward(batch['images'])
-            train_embeddings.append(emb.cpu().numpy())
+            train_embeddings.append(emb.detach().cpu().numpy())
             train_coordinates.append(batch['coordinates'].cpu().numpy())
     
     train_embeddings = np.concatenate(train_embeddings, axis=0)
@@ -594,7 +596,7 @@ def validate_model(model, train_df, val_df, config, train_labels=None):
     with torch.no_grad():
         for batch in val_loader:
             emb = model.forward(batch['images'])
-            val_embeddings.append(emb.cpu().numpy())
+            val_embeddings.append(emb.detach().cpu().numpy())
             val_coordinates.append(batch['coordinates'].cpu().numpy())
     
     val_embeddings = np.concatenate(val_embeddings, axis=0)
@@ -603,10 +605,16 @@ def validate_model(model, train_df, val_df, config, train_labels=None):
     # Build FAISS index with TRAIN embeddings
     dim = train_embeddings.shape[1]
     index = faiss.IndexFlatIP(dim)
-    index.add(train_embeddings.astype('float32'))
+    
+    # Ensure embeddings are float32 numpy arrays
+    train_embeddings_f32 = train_embeddings.astype(np.float32)
+    val_embeddings_f32 = val_embeddings.astype(np.float32)
+    
+    # Add train embeddings to index
+    index.add(train_embeddings_f32)
     
     # Search VAL embeddings against TRAIN index
-    D, I = index.search(val_embeddings.astype('float32'), 10)
+    D, I = index.search(val_embeddings_f32, 10)
     
     # Evaluate: val queries vs train gallery
     metrics = evaluate(

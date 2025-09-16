@@ -34,11 +34,11 @@ class Encoder(nn.Module):
                 "clip_l14": "openai/clip-vit-large-patch14",
                 "siglip_b16": "google/siglip-base-patch16-224",
             }[name]
-            self.processor = AutoProcessor.from_pretrained(model_id)
+            self.processor = AutoProcessor.from_pretrained(model_id, use_fast=True)
             self.model = AutoModel.from_pretrained(model_id).to(device).eval()
             self.kind = "transformers_clip"
         elif name == "dinov2_b":
-            self.processor = AutoImageProcessor.from_pretrained("facebook/dinov2-base")
+            self.processor = AutoImageProcessor.from_pretrained("facebook/dinov2-base", use_fast=True)
             self.model = AutoModel.from_pretrained("facebook/dinov2-base").to(device).eval()
             self.kind = "transformers_dino"
         elif name == "convnext_b":
