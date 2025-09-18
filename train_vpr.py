@@ -4,8 +4,10 @@ import numpy as np
 import pandas as pd
 from PIL import Image
 import torch, faiss, timm
+from faiss.contrib import torch_utils  # enable PyTorch tensor interop for FAISS
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision.transforms.functional as TF
 from torch.utils.data import Dataset, DataLoader
 import csv
 import os
@@ -139,7 +141,7 @@ class TrainableVPREncoder(Encoder):
         with torch.no_grad():
             if self.kind == "transformers_clip":
                 dummy_input = torch.randn(1, 3, self.input_size, self.input_size).to(self.device)
-                dummy_pil = [F.to_pil_image(dummy_input[0].cpu())]
+                dummy_pil = [TF.to_pil_image(dummy_input[0].cpu())]
                 inputs = self.processor(images=dummy_pil, return_tensors="pt").to(self.device)
                 feats = self.model.get_image_features(**inputs)
                 return feats.shape[1]
@@ -187,13 +189,10 @@ class TrainableVPREncoder(Encoder):
         return F.normalize(projected_feats, dim=-1)
     
     def encode_batch(self, pil_batch):
-        """For inference"""
-        if self.training:
-            return self.forward(pil_batch)
-        else:
-            with torch.no_grad():
-                projected = self.forward(pil_batch)
-                return projected.cpu().numpy()
+        """Inference helper: always returns numpy float32 embeddings"""
+        with torch.no_grad():
+            projected = self.forward(pil_batch)
+            return projected.cpu().numpy().astype(np.float32, copy=False)
 
 # ========== LOSS FUNCTIONS ==========
 class TripletLoss(nn.Module):
@@ -291,11 +290,12 @@ class HybridVPRLoss(nn.Module):
 def create_gps_labels(coordinates, threshold_meters=25):
     """Create cluster labels based on GPS proximity"""
     coords = np.array(coordinates)
-    labels = np.zeros(len(coords), dtype=int)
+    # Use -1 as sentinel for "unassigned" to avoid conflicts with label 0
+    labels = np.full(len(coords), -1, dtype=int)
     label_counter = 0
     
     for i in range(len(coords)):
-        if labels[i] == 0:  # Not yet assigned
+        if labels[i] == -1:  # Not yet assigned
             # Find all points within threshold using haversine
             distances = haversine_np(coords[i, 0], coords[i, 1], coords[:, 0], coords[:, 1])
             close_points = distances < threshold_meters
@@ -562,6 +562,15 @@ def validate_model(model, train_df, val_df, config, train_labels=None):
     """Proper validation: train embeddings vs val embeddings"""
     model.eval()
     
+    def _to_faiss_array(x):
+        # Accept torch tensor, list, or ndarray and return C-contiguous float32 2D ndarray
+        if isinstance(x, torch.Tensor):
+            x = x.detach().cpu().numpy()
+        x = np.asarray(x, dtype=np.float32)
+        if x.ndim == 1:
+            x = x.reshape(1, -1)
+        return np.ascontiguousarray(x)
+    
     # Create train dataset (use precomputed labels to avoid recreation)
     if train_labels is None:
         train_dataset = VPRDataset(train_df, config['pos_threshold_m'])
@@ -573,48 +582,67 @@ def validate_model(model, train_df, val_df, config, train_labels=None):
     val_dataset = VPRDataset(val_df, config['pos_threshold_m'], create_labels=False)
     
     # Create loaders
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=False, collate_fn=collate_fn)
-    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, collate_fn=collate_fn)
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=False, collate_fn=collate_fn, num_workers=0)
+    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, collate_fn=collate_fn, num_workers=0)
     
     # Extract train embeddings (gallery)
-    train_embeddings = []
+    train_embeddings_chunks = []
     train_coordinates = []
-    
     with torch.no_grad():
         for batch in train_loader:
-            emb = model.forward(batch['images'])
-            train_embeddings.append(emb.detach().cpu().numpy())
+            # Use inference path that returns numpy arrays directly
+            emb_np = model.encode_batch(batch['images'])
+            # Ensure each chunk is a C-contiguous float32 numpy array
+            emb_np = _to_faiss_array(emb_np)
+            train_embeddings_chunks.append(emb_np)
             train_coordinates.append(batch['coordinates'].cpu().numpy())
-    
-    train_embeddings = np.concatenate(train_embeddings, axis=0)
+    if not train_embeddings_chunks:
+        raise RuntimeError("No train embeddings collected during validation.")
+    train_embeddings = np.vstack(train_embeddings_chunks)
     train_coordinates = np.concatenate(train_coordinates, axis=0)
     
     # Extract val embeddings (queries)
-    val_embeddings = []
+    val_embeddings_chunks = []
     val_coordinates = []
-    
     with torch.no_grad():
         for batch in val_loader:
-            emb = model.forward(batch['images'])
-            val_embeddings.append(emb.detach().cpu().numpy())
+            emb_np = model.encode_batch(batch['images'])
+            emb_np = _to_faiss_array(emb_np)
+            val_embeddings_chunks.append(emb_np)
             val_coordinates.append(batch['coordinates'].cpu().numpy())
-    
-    val_embeddings = np.concatenate(val_embeddings, axis=0)
+    if not val_embeddings_chunks:
+        raise RuntimeError("No val embeddings collected during validation.")
+    val_embeddings = np.vstack(val_embeddings_chunks)
     val_coordinates = np.concatenate(val_coordinates, axis=0)
     
+    # Ensure embeddings are 2D, float32, and contiguous for FAISS
+    train_embeddings = _to_faiss_array(train_embeddings)
+    val_embeddings = _to_faiss_array(val_embeddings)
+
     # Build FAISS index with TRAIN embeddings
     dim = train_embeddings.shape[1]
     index = faiss.IndexFlatIP(dim)
-    
-    # Ensure embeddings are float32 numpy arrays
-    train_embeddings_f32 = train_embeddings.astype(np.float32)
-    val_embeddings_f32 = val_embeddings.astype(np.float32)
-    
-    # Add train embeddings to index
-    index.add(train_embeddings_f32)
+    # Strict sanity checks for FAISS inputs
+    if not isinstance(train_embeddings, np.ndarray) or train_embeddings.dtype != np.float32 or not train_embeddings.flags['C_CONTIGUOUS']:
+        raise TypeError(f"Train embeddings invalid for Faiss: type={type(train_embeddings)}, dtype={train_embeddings.dtype}, C={train_embeddings.flags['C_CONTIGUOUS']}")
+    if not isinstance(val_embeddings, np.ndarray) or val_embeddings.dtype != np.float32 or not val_embeddings.flags['C_CONTIGUOUS']:
+        raise TypeError(f"Val embeddings invalid for Faiss: type={type(val_embeddings)}, dtype={val_embeddings.dtype}, C={val_embeddings.flags['C_CONTIGUOUS']}")
+
+    # Convert to torch tensors and use FAISS torch interop (more robust than numpy on some builds)
+    train_t = torch.from_numpy(train_embeddings.copy(order='C'))
+    val_t = torch.from_numpy(val_embeddings.copy(order='C'))
+
+    # Optional: small debug trace for one run (kept concise)
+    print(f"[validate] FAISS add/train: {tuple(train_t.shape)} {train_t.dtype} torch-tensor")
+    index.add(train_t)
     
     # Search VAL embeddings against TRAIN index
-    D, I = index.search(val_embeddings_f32, 10)
+    print(f"[validate] FAISS search/val: {tuple(val_t.shape)} {val_t.dtype} torch-tensor")
+    D, I = index.search(val_t, 10)
+    if isinstance(I, torch.Tensor):
+        I = I.cpu().numpy()
+    if isinstance(D, torch.Tensor):
+        D = D.cpu().numpy()
     
     # Evaluate: val queries vs train gallery
     metrics = evaluate(
@@ -640,7 +668,7 @@ def main():
     ap.add_argument("--epochs", type=int, default=15, help="Number of epochs")
     ap.add_argument("--batch_size", type=int, default=32, help="Batch size")
     ap.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
-    ap.add_argument("--freeze_backbone", action="store_true", default=True, help="Freeze backbone")
+    ap.add_argument("--freeze_backbone", action="store_true", default=False, help="Freeze backbone")
     ap.add_argument("--save_path", type=str, default="", help="Path to save trained model")
     args = ap.parse_args()
     
