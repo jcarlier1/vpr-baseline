@@ -167,17 +167,30 @@ class TrainableVPREncoder(Encoder):
         print(f"Trainable ratio: {trainable_params/total_params:.1%}")
     
     def get_backbone_features(self, pil_batch):
-        """Extract features from backbone"""
+        """Extract features from backbone.
+        Accepts either a list of PIL images or a pre-transformed torch.Tensor of shape (B, C, H, W).
+        """
+        # If a batched tensor is provided, handle directly for timm; for transformers, convert back to PIL
+        is_tensor_batch = isinstance(pil_batch, torch.Tensor)
+
         if self.kind == "transformers_clip":
+            if is_tensor_batch:
+                # Convert each tensor image to PIL for the processor
+                pil_batch = [TF.to_pil_image(img.cpu()) for img in pil_batch]
             inputs = self.processor(images=pil_batch, return_tensors="pt").to(self.device)
             with torch.autocast(device_type="cuda", dtype=torch.float16):
                 feats = self.model.get_image_features(**inputs)
         elif self.kind == "transformers_dino":
+            if is_tensor_batch:
+                pil_batch = [TF.to_pil_image(img.cpu()) for img in pil_batch]
             inputs = self.processor(images=pil_batch, return_tensors="pt")["pixel_values"].to(self.device)
             with torch.autocast(device_type="cuda", dtype=torch.float16):
                 feats = self.model(inputs).last_hidden_state[:, 0]  # CLS token
         else:  # timm
-            x = torch.stack([self.timm_tf(img) for img in pil_batch]).to(self.device)
+            if is_tensor_batch:
+                x = pil_batch.to(self.device)
+            else:
+                x = torch.stack([self.timm_tf(img) for img in pil_batch]).to(self.device)
             with torch.autocast(device_type="cuda", dtype=torch.float16):
                 feats = self.model(x)
         return feats.float()
@@ -189,10 +202,12 @@ class TrainableVPREncoder(Encoder):
         return F.normalize(projected_feats, dim=-1)
     
     def encode_batch(self, pil_batch):
-        """Inference helper: always returns numpy float32 embeddings"""
+        """Inference helper: returns a torch.FloatTensor embeddings batch on CPU.
+        Downstream code can convert to numpy if needed.
+        """
         with torch.no_grad():
             projected = self.forward(pil_batch)
-            return projected.cpu().numpy().astype(np.float32, copy=False)
+            return projected.detach().cpu().float()
 
 # ========== LOSS FUNCTIONS ==========
 class TripletLoss(nn.Module):

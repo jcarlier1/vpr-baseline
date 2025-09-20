@@ -6,6 +6,8 @@ from PIL import Image
 import torch, faiss, timm
 import torch.nn as nn
 import torch.nn.functional as F
+import pickle
+import importlib
 
 from transformers import AutoProcessor, AutoImageProcessor, AutoModel
 
@@ -20,6 +22,100 @@ def haversine_np(lat1, lon1, lat2, lon2):
     a = np.sin(dlat * 0.5) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon * 0.5) ** 2
     c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
     return R * c  # meters
+
+# ---------- trained model loading ----------
+def _try_allowlist(paths):
+    """Try to allowlist globals for safe torch.load.
+    Returns True if at least one path was successfully added.
+    """
+    added_any = False
+    add_safe = getattr(torch.serialization, "add_safe_globals", None)
+    if add_safe is None:
+        return False
+    for path in paths:
+        try:
+            mod_path, attr = path.rsplit(".", 1)
+            mod = importlib.import_module(mod_path)
+            obj = getattr(mod, attr)
+            add_safe([obj])
+            added_any = True
+        except Exception:
+            pass
+    return added_any
+
+def load_trained_model(model_path, model_name, input_size=224, device="cuda", unsafe_load=False):
+    """Load a trained VPR model with safe weights-only loading when supported.
+    If safe load fails and `unsafe_load` is True, fall back to unsafe pickle load.
+    """
+    # Import TrainableVPREncoder here to avoid circular imports
+    from train_vpr import TrainableVPREncoder
+    
+    # Prefer safe weights-only loading
+    try:
+        checkpoint = torch.load(model_path, map_location=device, weights_only=True)
+    except TypeError:
+        # Older PyTorch: no weights_only kwarg
+        print("[warn] Your PyTorch version does not support weights_only; falling back to default torch.load.")
+        checkpoint = torch.load(model_path, map_location=device)
+    except Exception as e:
+        msg = str(e)
+        # Try allowlisting common NumPy globals used in checkpoints, then retry safe load
+        allowlisted = _try_allowlist([
+            "numpy.core.multiarray.scalar",
+            "numpy._core.multiarray.scalar",
+        ])
+        if allowlisted:
+            try:
+                checkpoint = torch.load(model_path, map_location=device, weights_only=True)
+            except Exception as e2:
+                if unsafe_load:
+                    print("[warn] Safe load failed after allowlisting; falling back to UNSAFE torch.load. Only do this if you trust the file.")
+                    checkpoint = torch.load(model_path, map_location=device)
+                else:
+                    raise RuntimeError(
+                        "Safe weights-only load failed (even after allowlisting). "
+                        "If you trust this checkpoint, rerun with --unsafe_load to allow an unsafe fallback.\n"
+                        f"Original error: {e2}"
+                    ) from e2
+        else:
+            if unsafe_load:
+                print("[warn] Safe load failed; falling back to UNSAFE torch.load. Only do this if you trust the file.")
+                checkpoint = torch.load(model_path, map_location=device)
+            else:
+                raise RuntimeError(
+                    "Safe weights-only load failed and allowlisting isn't available. "
+                    "If you trust this checkpoint, rerun with --unsafe_load to allow an unsafe fallback.\n"
+                    f"Original error: {e}"
+                ) from e
+    
+    config = checkpoint['config']
+    
+    # Create model with same config as training
+    model = TrainableVPREncoder(
+        model_name,
+        input_size=input_size,
+        device=device,
+        freeze_backbone=False,  # Keep backbone unfrozen as during training for compatibility
+        projection_dim=config['projection_dim'],
+        dropout=config['dropout']
+    )
+    
+    # Load trained weights
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.eval()
+    
+    print(f"Loaded trained model from epoch {checkpoint['epoch']} with R@1: {checkpoint['recall']:.4f}")
+    
+    return model
+
+def create_encoder(model_name, input_size=224, device="cuda", trained_model_path=None, unsafe_load=False):
+    """Factory function to create either a pretrained Encoder or load a TrainableVPREncoder from checkpoint."""
+    if trained_model_path:
+        # Load trained model
+        return load_trained_model(trained_model_path, model_name, input_size, device, unsafe_load)
+    else:
+        # Use pretrained model
+        return Encoder(model_name, input_size, device)
 
 # ---------- encoders ----------
 class Encoder(nn.Module):
@@ -169,6 +265,8 @@ def main():
     ap.add_argument("--pos_m", type=float, default=10.0)
     ap.add_argument("--k", type=int, default=10)
     ap.add_argument("--save_npz", type=str, default="")
+    ap.add_argument("--trained_model", type=str, default="", help="Path to trained model (.pth file). If provided, will load this instead of using pretrained weights.")
+    ap.add_argument("--unsafe_load", action="store_true", help="Allow unsafe torch.load fallback if safe load fails")
     args = ap.parse_args()
 
     print(f"Loading CSVs and filtering camera_id={args.camera_id}")
@@ -177,7 +275,15 @@ def main():
     print(f"Train images: {len(df_tr)}  Test images: {len(df_te)}")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    enc = Encoder(args.model, input_size=args.input, device=device)
+    
+    # Create encoder (either pretrained or trained)
+    if args.trained_model:
+        print(f"Loading trained model from: {args.trained_model}")
+        enc = create_encoder(args.model, input_size=args.input, device=device, 
+                           trained_model_path=args.trained_model, unsafe_load=args.unsafe_load)
+    else:
+        print(f"Using pretrained model: {args.model}")
+        enc = create_encoder(args.model, input_size=args.input, device=device)
 
     print("Embedding train...")
     xb, sec_per_img_train = batched_paths_to_embeddings(df_tr["abs_path"].tolist(), enc, args.batch)

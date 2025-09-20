@@ -1,4 +1,6 @@
 import argparse
+import pickle
+import importlib
 import torch
 import numpy as np
 import faiss
@@ -7,9 +9,68 @@ from pathlib import Path
 from vpr_baseline import load_csv, evaluate, batched_paths_to_embeddings
 from train_vpr import TrainableVPREncoder, set_reproducible_training
 
-def load_trained_model(model_path, model_name, input_size=224, device="cuda"):
-    """Load a trained VPR model"""
-    checkpoint = torch.load(model_path, map_location=device)
+def _try_allowlist(paths):
+    """Try to allowlist globals for safe torch.load.
+    Returns True if at least one path was successfully added.
+    """
+    added_any = False
+    add_safe = getattr(torch.serialization, "add_safe_globals", None)
+    if add_safe is None:
+        return False
+    for path in paths:
+        try:
+            mod_path, attr = path.rsplit(".", 1)
+            mod = importlib.import_module(mod_path)
+            obj = getattr(mod, attr)
+            add_safe([obj])
+            added_any = True
+        except Exception:
+            pass
+    return added_any
+
+def load_trained_model(model_path, model_name, input_size=224, device="cuda", unsafe_load=False):
+    """Load a trained VPR model with safe weights-only loading when supported.
+    If safe load fails and `unsafe_load` is True, fall back to unsafe pickle load.
+    """
+    # Prefer safe weights-only loading
+    try:
+        checkpoint = torch.load(model_path, map_location=device, weights_only=True)
+    except TypeError:
+        # Older PyTorch: no weights_only kwarg
+        print("[warn] Your PyTorch version does not support weights_only; falling back to default torch.load.")
+        checkpoint = torch.load(model_path, map_location=device)
+    except pickle.UnpicklingError as e:  # type: ignore[name-defined]
+        raise  # This except won't trigger because pickle isn't imported; kept for clarity
+    except Exception as e:
+        msg = str(e)
+        # Try allowlisting common NumPy globals used in checkpoints, then retry safe load
+        allowlisted = _try_allowlist([
+            "numpy.core.multiarray.scalar",
+            "numpy._core.multiarray.scalar",
+        ])
+        if allowlisted:
+            try:
+                checkpoint = torch.load(model_path, map_location=device, weights_only=True)
+            except Exception as e2:
+                if unsafe_load:
+                    print("[warn] Safe load failed after allowlisting; falling back to UNSAFE torch.load. Only do this if you trust the file.")
+                    checkpoint = torch.load(model_path, map_location=device)
+                else:
+                    raise RuntimeError(
+                        "Safe weights-only load failed (even after allowlisting). "
+                        "If you trust this checkpoint, rerun with --unsafe_load to allow an unsafe fallback.\n"
+                        f"Original error: {e2}"
+                    ) from e2
+        else:
+            if unsafe_load:
+                print("[warn] Safe load failed; falling back to UNSAFE torch.load. Only do this if you trust the file.")
+                checkpoint = torch.load(model_path, map_location=device)
+            else:
+                raise RuntimeError(
+                    "Safe weights-only load failed and allowlisting isn't available. "
+                    "If you trust this checkpoint, rerun with --unsafe_load to allow an unsafe fallback.\n"
+                    f"Original error: {e}"
+                ) from e
     config = checkpoint['config']
     
     # Create model with same config as training
@@ -17,7 +78,7 @@ def load_trained_model(model_path, model_name, input_size=224, device="cuda"):
         model_name,
         input_size=input_size,
         device=device,
-        freeze_backbone=True,  # This was used during training
+        freeze_backbone=False,  # Keep backbone unfrozen as during training for compatibility
         projection_dim=config['projection_dim'],
         dropout=config['dropout']
     )
@@ -30,7 +91,7 @@ def load_trained_model(model_path, model_name, input_size=224, device="cuda"):
     
     return model
 
-def evaluate_trained_model(model, train_csv, test_csv, camera_id, pos_thresh_m=10.0, batch_size=128):
+def evaluate_trained_model(model, train_csv, test_csv, camera_id, pos_thresh_m=5.0, batch_size=128):
     """Evaluate trained model using the same protocol as baseline"""
     
     # Load data
@@ -50,11 +111,23 @@ def evaluate_trained_model(model, train_csv, test_csv, camera_id, pos_thresh_m=1
         df_test["abs_path"].tolist(), model, batch_size
     )
     
-    # FAISS search
-    dim = train_embeddings.shape[1]
+    # Ensure numpy float32 for FAISS
+    def _to_faiss_array(x):
+        if isinstance(x, torch.Tensor):
+            x = x.detach().cpu().numpy()
+        x = np.asarray(x, dtype=np.float32)
+        if x.ndim == 1:
+            x = x.reshape(1, -1)
+        return np.ascontiguousarray(x)
+
+    train_np = _to_faiss_array(train_embeddings)
+    test_np = _to_faiss_array(test_embeddings)
+
+    # FAISS search (inner product on L2-normalized vectors)
+    dim = train_np.shape[1]
     index = faiss.IndexFlatIP(dim)
-    index.add(train_embeddings.astype("float32"))
-    D, I = index.search(test_embeddings.astype("float32"), 10)
+    index.add(train_np)
+    D, I = index.search(test_np, 10)
     
     # Evaluate
     metrics = evaluate(
@@ -75,9 +148,10 @@ def main():
                     choices=["clip_b32", "clip_l14", "siglip_b16", "dinov2_b", "convnext_b", "resnet50"],
                     help="Model name")
     ap.add_argument("--input_size", type=int, default=224, help="Input size")
-    ap.add_argument("--pos_m", type=float, default=10.0, help="GPS threshold for positives")
+    ap.add_argument("--pos_m", type=float, default=5.0, help="GPS threshold for positives")
     ap.add_argument("--batch_size", type=int, default=128, help="Batch size for inference")
     ap.add_argument("--seed", type=int, default=42, help="Random seed")
+    ap.add_argument("--unsafe_load", action="store_true", help="Allow unsafe torch.load fallback if safe load fails")
     args = ap.parse_args()
     
     # Set reproducibility
@@ -85,7 +159,7 @@ def main():
     
     # Load trained model
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = load_trained_model(args.model_path, args.model, args.input_size, device)
+    model = load_trained_model(args.model_path, args.model, args.input_size, device, unsafe_load=args.unsafe_load)
     
     # Evaluate
     metrics, train_time, test_time = evaluate_trained_model(
